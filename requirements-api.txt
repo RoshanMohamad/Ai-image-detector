@@ -1,0 +1,14 @@
+# Core ML dependencies
+transformers
+huggingface_hub
+torch
+pillow
+python-dotenv
+
+# API dependencies
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Optional: for better performance
+# gunicorn  # For production deployment on Linux
