@@ -1,7 +1,9 @@
 import os
 import io
+import logging
 from typing import List, Dict
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -12,47 +14,111 @@ import uvicorn
 # Load environment variables
 load_dotenv()
 
-# Initialize FastAPI app
+# Configure logging (production-grade instead of print statements)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# Constants
+MODEL_NAME = "umm-maybe/AI-image-detector"
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+# Global model pipeline
+classifier = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Modern lifespan handler (replaces deprecated @app.on_event)."""
+    global classifier
+    logger.info(f"Loading model: {MODEL_NAME}...")
+    try:
+        classifier = pipeline("image-classification", model=MODEL_NAME)
+    except Exception as e:
+        logger.warning(f"Online model load failed ({e}), trying offline/cached mode...")
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        classifier = pipeline("image-classification", model=MODEL_NAME)
+    logger.info("Model loaded successfully!")
+    yield
+    # Cleanup on shutdown
+    logger.info("Shutting down API server...")
+
+
+# Initialize FastAPI app with lifespan
 app = FastAPI(
     title="AI Image Detector API",
-    description="API for detecting AI-generated images using the umm-maybe/AI-image-detector model",
-    version="1.0.0"
+    description="API for detecting AI-generated images using the umm-maybe/AI-image-detector model. "
+                "Upload any image and get a confidence score indicating whether it's AI-generated or real.",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
-# CORS middleware - configure as needed
+# CORS middleware — properly configured (no wildcard with credentials)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update this in production to specific domains
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,  # Fixed: can't use True with wildcard origins
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global model pipeline
-MODEL_NAME = "umm-maybe/AI-image-detector"
-classifier = None
 
-@app.on_event("startup")
-async def load_model():
-    """Load the model on startup to avoid loading on every request."""
-    global classifier
-    print(f"Loading model: {MODEL_NAME}...")
-    classifier = pipeline("image-classification", model=MODEL_NAME)
-    print("Model loaded successfully!")
+def validate_file(file: UploadFile, contents: bytes) -> None:
+    """Validate uploaded file type and size."""
+    allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/bmp"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type '{file.content_type}'. Allowed: {', '.join(allowed_types)}"
+        )
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({len(contents) / 1024 / 1024:.1f}MB). Max size: {MAX_FILE_SIZE / 1024 / 1024:.0f}MB"
+        )
+
+
+def format_prediction(results: list, threshold: float, filename: str) -> Dict:
+    """Format model output into a clean API response with verdict logic."""
+    top = results[0] if results else None
+    if top:
+        is_ai = top["label"].lower() in ["artificial", "ai"]
+        verdict = "AI Generated" if is_ai and top["score"] >= threshold else "Real"
+    else:
+        verdict = "Unknown"
+
+    return {
+        "filename": filename,
+        "verdict": verdict,
+        "confidence": round(top["score"], 4) if top else 0.0,
+        "threshold_used": threshold,
+        "predictions": [
+            {"label": r["label"], "score": round(r["score"], 4)}
+            for r in results
+        ]
+    }
+
 
 @app.get("/")
 async def root():
-    """Health check endpoint."""
+    """API information and available endpoints."""
     return {
         "message": "AI Image Detector API is running",
         "model": MODEL_NAME,
+        "version": "1.0.0",
         "endpoints": {
-            "health": "/health",
-            "detect": "/detect (POST)",
-            "detect_batch": "/detect/batch (POST)",
-            "docs": "/docs"
+            "health": "GET /health",
+            "detect": "POST /detect",
+            "detect_batch": "POST /detect/batch",
+            "docs": "GET /docs"
         }
     }
+
 
 @app.get("/health")
 async def health_check():
@@ -65,107 +131,106 @@ async def health_check():
         "ready": True
     }
 
+
 @app.post("/detect")
-async def detect_image(file: UploadFile = File(...)) -> Dict:
+async def detect_image(
+    file: UploadFile = File(..., description="Image file (JPEG, PNG, WEBP, BMP)"),
+    threshold: float = Query(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Confidence threshold for AI detection verdict (0.0 to 1.0)"
+    )
+) -> Dict:
     """
     Detect if an uploaded image is AI-generated or real.
-    
-    Args:
-        file: Image file (JPEG, PNG, WEBP, BMP)
-        
-    Returns:
-        JSON with classification results
+
+    - **file**: Image file to analyze
+    - **threshold**: Confidence threshold — predictions above this are labeled "AI Generated"
+
+    Returns classification verdict, confidence score, and detailed predictions.
     """
     if classifier is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
-    
-    # Validate file type
-    allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/bmp"]
-    if file.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Invalid file type. Allowed types: {', '.join(allowed_types)}"
-        )
-    
+
+    # Read and validate
+    contents = await file.read()
+    validate_file(file, contents)
+
     try:
-        # Read and process image
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents))
-        
-        # Run inference
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
         results = classifier(image)
-        
-        # Format response
-        return {
-            "filename": file.filename,
-            "predictions": results,
-            "top_prediction": results[0] if results else None
-        }
-        
+        logger.info(f"Detected {file.filename}: {results[0]['label']} ({results[0]['score']:.4f})")
+        return format_prediction(results, threshold, file.filename)
+
     except Exception as e:
+        logger.error(f"Error processing {file.filename}: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
 
+
 @app.post("/detect/batch")
-async def detect_images_batch(files: List[UploadFile] = File(...)) -> Dict:
+async def detect_images_batch(
+    files: List[UploadFile] = File(..., description="List of image files (max 10)"),
+    threshold: float = Query(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Confidence threshold for AI detection verdict"
+    )
+) -> Dict:
     """
-    Detect multiple images in a batch.
-    
-    Args:
-        files: List of image files
-        
-    Returns:
-        JSON with classification results for each image
+    Detect multiple images in a batch (max 10 images).
+
+    Returns classification results for each image individually.
     """
     if classifier is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
-    
+
     if len(files) > 10:
         raise HTTPException(status_code=400, detail="Maximum 10 images per batch")
-    
+
     results_batch = []
-    
+
     for file in files:
         try:
-            # Validate file type
-            allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/bmp"]
-            if file.content_type not in allowed_types:
-                results_batch.append({
-                    "filename": file.filename,
-                    "error": "Invalid file type",
-                    "predictions": None
-                })
-                continue
-            
-            # Read and process image
             contents = await file.read()
-            image = Image.open(io.BytesIO(contents))
-            
-            # Run inference
+            validate_file(file, contents)
+
+            image = Image.open(io.BytesIO(contents)).convert("RGB")
             predictions = classifier(image)
-            
+
+            result = format_prediction(predictions, threshold, file.filename)
+            result["error"] = None
+            results_batch.append(result)
+            logger.info(f"Batch - {file.filename}: {predictions[0]['label']} ({predictions[0]['score']:.4f})")
+
+        except HTTPException as he:
             results_batch.append({
                 "filename": file.filename,
-                "predictions": predictions,
-                "top_prediction": predictions[0] if predictions else None,
-                "error": None
+                "error": he.detail,
+                "verdict": None,
+                "predictions": None
             })
-            
         except Exception as e:
+            logger.error(f"Batch error for {file.filename}: {e}")
             results_batch.append({
                 "filename": file.filename,
                 "error": str(e),
+                "verdict": None,
                 "predictions": None
             })
-    
+
     return {
         "total_images": len(files),
+        "successful": sum(1 for r in results_batch if r.get("error") is None),
+        "failed": sum(1 for r in results_batch if r.get("error") is not None),
         "results": results_batch
     }
 
+
 if __name__ == "__main__":
-    # Get port from environment or use default
     port = int(os.getenv("PORT", 8000))
     host = os.getenv("HOST", "0.0.0.0")
-    
-    print(f"Starting API server on {host}:{port}")
+
+    logger.info(f"Starting API server on {host}:{port}")
     uvicorn.run(app, host=host, port=port)

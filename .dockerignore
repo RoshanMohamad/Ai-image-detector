@@ -29,3 +29,12 @@ Thumbs.db
 # Project specific
 detect.py
 README.md
+DEPLOYMENT.md
+GITHUB_DEPLOYMENT.md
+push_to_github.bat
+test_api.py
+
+# Secrets - NEVER include in Docker image
+.env
+*.env
+.env.*
